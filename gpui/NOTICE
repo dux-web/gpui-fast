@@ -1,0 +1,18 @@
+GPUI Fast compatibility distribution
+
+Derived from Longbridge GPUI Fast v0.1.8 at
+d599978f0ecf794b16cb6ec0b5875f818b822507:
+https://github.com/longbridge/gpui-fast
+
+Generated with the upstream release exporter from source commit
+8f238ac038dc7ce926801c0369effbd78a8f855d:
+https://github.com/dux-web/gpui-fast
+
+Sailry contributors modified crates/gpui/src/fast/layout.rs and
+crates/gpui/src/fast/tests/layout.rs to restore retained child links after
+reparenting. The change is submitted upstream at
+https://github.com/longbridge/gpui-fast/pull/68.
+
+The upstream Apache-2.0 license and attribution notices are retained.
+See LICENSE. The generated distribution adds modification notices to the
+two changed source files; their layout and test code matches the source commit.
