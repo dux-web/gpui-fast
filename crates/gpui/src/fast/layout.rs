@@ -521,8 +521,7 @@ impl TaffyLayoutEngine {
         let robbed = &self.retention.robbed_parents;
         let all_there = keys.iter().all(|key| {
             self.retention.retained.get(key).is_some_and(|node| {
-                node.claimed_in_frame != frame
-                    && (robbed.is_empty() || !robbed.contains(&node.id))
+                node.claimed_in_frame != frame && (robbed.is_empty() || !robbed.contains(&node.id))
             })
         });
         if all_there {
@@ -567,13 +566,7 @@ impl TaffyLayoutEngine {
 
     /// Records a freshly allocated node under `key`, or as transient when there
     /// is no key to record it under.
-    fn retain(
-        &mut self,
-        key: Option<u64>,
-        id: LayoutId,
-        measured: bool,
-        style_fingerprint: u64,
-    ) {
+    fn retain(&mut self, key: Option<u64>, id: LayoutId, measured: bool, style_fingerprint: u64) {
         let retention = &mut self.retention;
         let Some(key) = key else {
             retention.transient.push(id);
