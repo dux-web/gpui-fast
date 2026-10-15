@@ -1,4 +1,6 @@
 // Modified by Longbridge for gpui-fast.
+// Modified by Sailry contributors to forward macOS overlay input regions.
+// Source: 90f1ec3153638082560f74a49440cf86bf7a893d; longbridge/gpui-fast PR #69.
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -2254,6 +2256,10 @@ impl PlatformWindow for MacWindow {
             let event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
         }
+    }
+
+    fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        crate::fast::composition::set_input_region(&self.0, region);
     }
 
     fn can_start_external_drag(&self) -> bool {
