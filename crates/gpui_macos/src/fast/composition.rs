@@ -163,6 +163,12 @@ pub(crate) unsafe fn build_overlay_view_class() {
 }
 
 extern "C" fn overlay_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    // Preserve AppKit visibility, clipping and descendant selection. Only the
+    // overlay itself is filtered by this surface's GPUI input regions.
+    let target: id = unsafe { msg_send![super(this, class!(NSView)), hitTest: point] };
+    if target != this as *const Object as id {
+        return target;
+    }
     let regions = unsafe {
         let raw: *mut c_void = *this.get_ivar(OVERLAY_INPUT_IVAR);
         &*(raw as *const RefCell<Vec<gpui::Hitbox>>)
@@ -898,3 +904,6 @@ impl Drop for MacNativeSurface {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
