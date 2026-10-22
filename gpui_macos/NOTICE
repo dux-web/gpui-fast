@@ -1,0 +1,20 @@
+GPUI Fast compatibility distribution
+
+Derived from Longbridge GPUI Fast v0.1.10 at
+b836dd970b26830f2124b7cf91b0e19018fd12da:
+https://github.com/longbridge/gpui-fast
+
+Generated with the upstream release exporter from source commit
+8e068a13c198048159553fac2797f60b7647bc10:
+https://github.com/dux-web/gpui-fast
+
+Upstream PR #67 replaces the earlier overlay input-region patch; upstream
+PR #68 replaces the earlier retained-child reparenting patch. Neither old
+patch is replayed in this distribution.
+
+Sailry contributors modified gpui_macos/src/fast/composition.rs to preserve
+AppKit's descendant, visibility and clipping hit tests before filtering the
+GPUI overlay itself, with regressions in fast/composition/tests.rs.
+
+The upstream Apache-2.0 licenses and attribution notices are retained.
+See LICENSE and each package's LICENSE.

@@ -1234,7 +1234,9 @@ impl X11Client {
                 window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }));
             }
             Event::XinputButtonPress(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self
+                    .get_window(event.event)
+                    .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_xinput_info(event.mods);
@@ -1243,6 +1245,11 @@ impl X11Client {
                 let position = point(
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                let position = crate::fast::composition::x11::pointer_position(
+                    event.event,
+                    position,
+                    state.scale_factor,
                 );
 
                 if state.composing && state.ximc.is_some() {
@@ -1311,7 +1318,9 @@ impl X11Client {
                 }
             }
             Event::XinputButtonRelease(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self
+                    .get_window(event.event)
+                    .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
                 let mut state = self.0.borrow_mut();
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1319,6 +1328,11 @@ impl X11Client {
                 let position = point(
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                let position = crate::fast::composition::x11::pointer_position(
+                    event.event,
+                    position,
+                    state.scale_factor,
                 );
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
@@ -1336,7 +1350,9 @@ impl X11Client {
                 }
             }
             Event::XinputMotion(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self
+                    .get_window(event.event)
+                    .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
                 let mut state = self.0.borrow_mut();
                 state.restore_cursor_after_hide();
                 if window.is_blocked() {
@@ -1371,6 +1387,11 @@ impl X11Client {
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
+                let position = crate::fast::composition::x11::pointer_position(
+                    event.event,
+                    position,
+                    state.scale_factor,
+                );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 drop(state);
@@ -1397,10 +1418,14 @@ impl X11Client {
                 }
             }
             Event::XinputEnter(event) if event.mode == xinput::NotifyMode::NORMAL => {
-                let window = self.get_window(event.event)?;
+                let window = self
+                    .get_window(event.event)
+                    .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
                 window.set_hovered(true);
                 let mut state = self.0.borrow_mut();
-                state.mouse_focused_window = Some(event.event);
+                state.mouse_focused_window = Some(
+                    crate::fast::composition::x11::pointer_window_id(event.event),
+                );
                 state.restore_cursor_after_hide();
             }
             Event::XinputLeave(event) if event.mode == xinput::NotifyMode::NORMAL => {
@@ -1414,11 +1439,18 @@ impl X11Client {
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
+                let position = crate::fast::composition::x11::pointer_position(
+                    event.event,
+                    position,
+                    state.scale_factor,
+                );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 drop(state);
 
-                let window = self.get_window(event.event)?;
+                let window = self
+                    .get_window(event.event)
+                    .or_else(|| crate::fast::composition::x11::pointer_window(event.event))?;
                 window.handle_input(PlatformInput::MouseExited(gpui::MouseExitEvent {
                     pressed_button,
                     position,

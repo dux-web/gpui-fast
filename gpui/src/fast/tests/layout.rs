@@ -1,6 +1,4 @@
 // Modified by Longbridge for gpui-fast.
-// Modified by Sailry contributors to cover retained child links after reparenting.
-// Source: 8f238ac038dc7ce926801c0369effbd78a8f855d; longbridge/gpui-fast PR #68.
 //! Tests of retained layout: layout nodes carried from one frame to the next,
 //! the keys that match them to elements, and the statistics that show it.
 
@@ -377,41 +375,77 @@ fn a_node_adopted_from_another_parent_keeps_its_position() {
     );
 }
 
-#[test]
-fn restores_reparented_children() {
-    use crate::TaffyLayoutEngine;
-
-    let mut engine = TaffyLayoutEngine::new();
-    let request = |engine: &mut TaffyLayoutEngine, key, children: &[_]| {
-        engine.request_layout(Some(key), crate::Style::default(), px(14.), 1., children)
-    };
+/// Lays out a child under one parent, then has another parent take it in
+/// the next frame while the first is kept without being requested. Returns
+/// the engine with the child, the parent it was taken from and the one that
+/// took it.
+fn child_taken_from_a_kept_parent() -> (crate::TaffyLayoutEngine, [crate::LayoutId; 3]) {
+    let mut engine = crate::TaffyLayoutEngine::new();
     let child = request(&mut engine, 1, &[]);
     let original = request(&mut engine, 2, &[child]);
-    let replacement = request(&mut engine, 3, &[]);
     engine.clear();
 
     assert_eq!(request(&mut engine, 1, &[]), child);
-    assert_eq!(request(&mut engine, 3, &[child]), replacement);
+    let adopter = request(&mut engine, 3, &[child]);
+    engine.keep_retained(&[2]);
+    engine.clear();
     assert!(engine.taffy.children(original.into()).unwrap().is_empty());
-    assert_eq!(engine.taffy.parent(child.into()), Some(replacement.into()));
+    assert_eq!(engine.taffy.parent(child.into()), Some(adopter.into()));
+    (engine, [child, original, adopter])
+}
 
-    // The original parent's retained request still names the child, even
-    // though Taffy removed it when the replacement adopted it.
+fn request(
+    engine: &mut crate::TaffyLayoutEngine,
+    key: u64,
+    children: &[crate::LayoutId],
+) -> crate::LayoutId {
+    engine.request_layout(Some(key), crate::Style::default(), px(14.), 1., children)
+}
+
+/// A parent requested again with the child another parent took from it
+/// takes the child back, though it asks for the children it asked for
+/// before, and is left alone once it has it.
+#[test]
+fn a_parent_requested_again_takes_back_a_child_taken_from_it() {
+    let (mut engine, [child, original, adopter]) = child_taken_from_a_kept_parent();
+
+    let writes = engine.retention.stats.children_writes;
+    assert_eq!(request(&mut engine, 1, &[]), child);
     assert_eq!(request(&mut engine, 2, &[child]), original);
-    assert_eq!(engine.taffy.parent(child.into()), Some(original.into()));
+    engine.clear();
+    assert_eq!(engine.retention.stats.children_writes, writes + 1);
     assert_eq!(
         engine.taffy.children(original.into()).unwrap(),
         [child.into()]
     );
-    assert!(
-        engine
-            .taffy
-            .children(replacement.into())
-            .unwrap()
-            .is_empty()
-    );
     assert!(engine.layout_reaches(original, child));
-    assert!(!engine.layout_reaches(replacement, child));
+    assert!(!engine.layout_reaches(adopter, child));
+
+    let changes = engine.layout_changes();
+    assert_eq!(request(&mut engine, 1, &[]), child);
+    assert_eq!(request(&mut engine, 2, &[child]), original);
+    engine.clear();
+    assert_eq!(engine.retention.stats.children_writes, writes + 1);
+    assert_eq!(engine.layout_changes(), changes);
+}
+
+/// A subtree whose parent lost a child to another parent cannot be kept as
+/// it is, since the parent no longer holds the child it was laid out with.
+/// It is laid out again instead, which gives the child back, and can be
+/// kept from then on.
+#[test]
+fn a_subtree_missing_a_taken_child_is_not_kept() {
+    let (mut engine, [child, original, _]) = child_taken_from_a_kept_parent();
+
+    assert!(!engine.try_keep_retained(&[1, 2]));
+    assert_eq!(request(&mut engine, 1, &[]), child);
+    assert_eq!(request(&mut engine, 2, &[child]), original);
+    engine.clear();
+    assert!(engine.layout_reaches(original, child));
+
+    assert!(engine.try_keep_retained(&[1, 2]));
+    engine.clear();
+    assert!(engine.layout_reaches(original, child));
 }
 
 /// Rows of a uniform list five rows tall, scrolled to `scroll_top`.

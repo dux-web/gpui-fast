@@ -1,6 +1,4 @@
 // Modified by Longbridge for gpui-fast.
-// Modified by Sailry contributors to forward macOS overlay input regions.
-// Source: 90f1ec3153638082560f74a49440cf86bf7a893d; longbridge/gpui-fast PR #69.
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -434,6 +432,7 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
     unsafe {
         let mut decl = ClassDecl::new(name, superclass).unwrap();
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+        crate::fast::composition::register_window_input(&mut decl, superclass);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
 
         decl.add_method(
@@ -673,7 +672,7 @@ pub(crate) struct MacWindowState {
     frame_source: Option<WindowFrameSource>,
     pub(crate) renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
-    event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
+    pub(crate) event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
     visibility_callback: Option<Box<dyn FnMut(WindowVisibility)>>,
     // `None` until a callback is registered, so notifications during
@@ -978,6 +977,7 @@ impl MacWindow {
             display_id,
             window_min_size,
             tabbing_identifier,
+            use_display_p3,
             ..
         }: WindowParams,
         cursor_visible: Arc<AtomicBool>,
@@ -1114,6 +1114,7 @@ impl MacWindow {
                     native_view as *mut _,
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
+                    use_display_p3,
                 ),
                 request_frame_callback: None,
                 event_callback: None,
@@ -2258,10 +2259,6 @@ impl PlatformWindow for MacWindow {
         }
     }
 
-    fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        crate::fast::composition::set_input_region(&self.0, region);
-    }
-
     fn can_start_external_drag(&self) -> bool {
         true
     }
@@ -2821,6 +2818,9 @@ pub(crate) extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: 
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
+    if crate::fast::composition::native_event_observed(&lock, native_event) {
+        return;
+    }
     let window_height = lock.content_size().height;
     let native_event_type = unsafe { native_event.eventType() };
     match native_event_type {
@@ -2969,8 +2969,8 @@ pub(crate) extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: 
 
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
-            callback(event);
-            window_state.lock().event_callback = Some(callback);
+            let result = callback(event);
+            crate::fast::composition::complete_event(&window_state, native_event, callback, result);
         }
     }
 }

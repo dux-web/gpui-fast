@@ -1,6 +1,4 @@
 // Modified by Longbridge for gpui-fast.
-// Modified by Sailry contributors to limit macOS overlay input to GPUI hit regions.
-// Source: 90f1ec3153638082560f74a49440cf86bf7a893d; longbridge/gpui-fast PR #69.
 //! Window composition: native views between GPUI's content and its overlays.
 //!
 //! Ported from zed-industries/zed#62379. A window paints one scene, as
@@ -36,12 +34,12 @@
 //! view is prepainted, it moves back below it. Overlays drawn over a native
 //! surface hosted on the overlay surface are then covered by it.
 
-#[cfg(any(target_os = "macos", test))]
-use crate::Hitbox;
 use crate::window::PaintIndex;
-use crate::{Bounds, DevicePixels, PlatformWindow, Point, Scene, Window, scene::PaintOperation};
-#[cfg(any(target_os = "macos", test))]
-use crate::{Pixels, px};
+use crate::{
+    Bounds, DevicePixels, DispatchEventResult, Hitbox, HitboxBehavior, HitboxId, MouseButton,
+    MouseExitEvent, MouseMoveEvent, Pixels, PlatformInput, PlatformWindow, Point, Scene, Window,
+    scene::PaintOperation,
+};
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::FxHashMap;
 use gpui_util::ResultExt as _;
@@ -339,6 +337,11 @@ pub trait PlatformSurfaceAttachment {
     }
     /// Updates whether the native surface participates in composition.
     fn set_visible(&self, visible: bool) -> Result<()>;
+    /// Whether GPUI forwards pointer input to a windowless consumer.
+    /// OS-managed child views keep their native event path by default.
+    fn input_forwarding(&self) -> bool {
+        false
+    }
     /// Returns the platform attachment object: an `NSView` pointer as `usize`
     /// on macOS, an `IDCompositionVisual` as `windows::core::IUnknown` on
     /// Windows, a `raw_window_handle::RawWindowHandle` on Linux.
@@ -358,11 +361,30 @@ pub struct ComposedSceneLayer {
 pub struct ComposedScene<'a> {
     scene: &'a Scene,
     layers: Vec<ComposedSceneLayer>,
+    input: &'a SurfaceInput,
 }
 
 impl<'a> ComposedScene<'a> {
-    pub(crate) fn new(scene: &'a Scene, layers: Vec<ComposedSceneLayer>) -> Self {
-        Self { scene, layers }
+    pub(crate) fn new(
+        scene: &'a Scene,
+        layers: Vec<ComposedSceneLayer>,
+        input: &'a SurfaceInput,
+    ) -> Self {
+        Self {
+            scene,
+            layers,
+            input,
+        }
+    }
+
+    /// The prepared, clipped input regions belonging to this GPUI surface.
+    /// Regions retain their stacking order and mouse/scroll behavior.
+    pub fn layer_hitboxes(&self, layer: &ComposedSceneLayer) -> &[Hitbox] {
+        self.input
+            .hitboxes
+            .get(&layer.surface)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Returns the complete scene containing all GPUI planes.
@@ -449,8 +471,8 @@ impl Scene {
     /// Returns whether the scene contains no drawable primitives.
     ///
     /// A scene may have paint operations that only open and close empty layers,
-    /// so `len() == 0` is not equivalent to having no visible/input-relevant
-    /// overlay content.
+    /// so `len() == 0` is not equivalent to having no visible primitives.
+    /// Transparent input regions are prepared separately from this scene.
     pub fn is_empty(&self) -> bool {
         self.shadows.is_empty()
             && self.quads.is_empty()
@@ -479,6 +501,7 @@ impl Scene {
             .get(range.clone())
             .context("scene replay range ends past the scene")?;
         let mut active_layers = Vec::new();
+        let mut active_clips = Vec::new();
         for operation in prefix {
             match operation {
                 PaintOperation::StartLayer(bounds) => active_layers.push(*bounds),
@@ -489,12 +512,21 @@ impl Scene {
                     );
                 }
                 PaintOperation::Primitive(_) => {}
+                PaintOperation::FastRoundedClip(clip) => {
+                    crate::fast::rounded_clip::track(*clip, &mut active_clips)?
+                }
             }
         }
 
         crate::fast::layers::paint::replay_layers(self, range, previous_scene);
         for bounds in &active_layers {
             self.push_layer(*bounds);
+        }
+        for shape in &active_clips {
+            crate::fast::rounded_clip::record(
+                self,
+                crate::fast::rounded_clip::ClipOperation::Begin(*shape),
+            );
         }
         for operation in operations {
             match operation {
@@ -510,10 +542,17 @@ impl Scene {
                     );
                     self.pop_layer();
                 }
+                PaintOperation::FastRoundedClip(clip) => {
+                    crate::fast::rounded_clip::track(*clip, &mut active_clips)?;
+                    crate::fast::rounded_clip::record(self, *clip);
+                }
             }
         }
         for _ in active_layers {
             self.pop_layer();
+        }
+        for _ in active_clips {
+            crate::fast::rounded_clip::record(self, crate::fast::rounded_clip::ClipOperation::End);
         }
         Ok(())
     }
@@ -522,38 +561,160 @@ impl Scene {
 /// Where each stretch of a frame's scene is presented: the GPUI surface
 /// painting switched to, and the scene length at the switch.
 #[derive(Default)]
-pub(crate) struct SurfaceStarts {
-    scene: Vec<(CompositionSurfaceId, usize)>,
-    overlay_hitbox_start: Option<usize>,
+pub(crate) struct SurfaceStarts(Vec<(CompositionSurfaceId, usize)>);
+
+/// Composition ownership accompanies existing hitbox identities through retained
+/// and scroll-layer replay; no second layout or input tree is built.
+#[derive(Default)]
+pub(crate) struct SurfaceInput {
+    order: Vec<(CompositionSurfaceId, Option<Bounds<Pixels>>)>,
+    scope: Option<CompositionSurfaceId>,
+    base: Option<CompositionSurfaceId>,
+    owners: FxHashMap<HitboxId, CompositionSurfaceId>,
+    hitboxes: FxHashMap<CompositionSurfaceId, Vec<Hitbox>>,
+}
+
+impl SurfaceInput {
+    pub(crate) fn clear(&mut self) {
+        self.scope = None;
+        self.base = None;
+        self.order.clear();
+        self.owners.clear();
+        for hitboxes in self.hitboxes.values_mut() {
+            hitboxes.clear();
+        }
+    }
+}
+
+fn begin_input(window: &mut Window, overlay: bool) {
+    let state = window.fast_composition.0.borrow();
+    state
+        .prepainting
+        .set(Some(if overlay { Host::Overlay } else { Host::Base }));
+    let input = &mut window.next_frame.fast_composition_input;
+    input.base = (!state.platform_surfaces.is_empty()).then_some(state.base_surface);
+    input.scope = state.enabled.then_some(if overlay {
+        state.overlay_surface
+    } else {
+        state.base_surface
+    });
+}
+
+pub(crate) fn input_surface(window: &Window) -> Option<CompositionSurfaceId> {
+    window.next_frame.fast_composition_input.scope
+}
+
+pub(crate) fn record_input(window: &mut Window, id: HitboxId) {
+    let input = &mut window.next_frame.fast_composition_input;
+    if let (Some(base), Some(surface)) = (input.base, input.scope) {
+        if surface != base {
+            input.owners.insert(id, surface);
+        }
+    }
+}
+
+pub(crate) fn finish_input(window: &mut Window) {
+    synchronize_geometry(window);
+    let scale = window.scale_factor();
+    let state = window.fast_composition.0.borrow();
+    let input = &mut window.next_frame.fast_composition_input;
+    if !state.enabled || state.platform_surfaces.is_empty() {
+        input.hitboxes.clear();
+        return;
+    }
+    input
+        .hitboxes
+        .retain(|surface, _| state.tree.kind(*surface).is_ok());
+    for surface in state.input_order.iter().copied() {
+        let native = state.platform_surfaces.get(&surface).map(|native| {
+            input_bounds(&state, surface, native.bounds().to_pixels(scale), scale)
+                .unwrap_or_default()
+        });
+        input.order.push((surface, native));
+    }
+    for hitbox in &window.next_frame.hitboxes {
+        let surface = input
+            .owners
+            .get(&hitbox.id)
+            .or_else(|| {
+                window
+                    .rendered_frame
+                    .fast_composition_input
+                    .owners
+                    .get(&hitbox.id)
+            })
+            .copied()
+            .unwrap_or(state.base_surface);
+        if !matches!(state.tree.kind(surface), Ok(CompositionSurfaceKind::Gpui)) {
+            continue;
+        }
+        if surface != state.base_surface {
+            input.owners.insert(hitbox.id, surface);
+        }
+        let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+        let Some(bounds) = input_bounds(&state, surface, bounds, scale) else {
+            continue;
+        };
+        if !bounds.is_empty() {
+            let mut clipped = hitbox.clone();
+            clipped.bounds = bounds;
+            input.hitboxes.entry(surface).or_default().push(clipped);
+        }
+    }
+}
+
+/// Native content blocks GPUI hover and click targets behind it, while keeping
+/// the existing GPUI scroll blockers and capture dispatch unchanged.
+pub(crate) fn hit_test(
+    frame: &crate::window::Frame,
+    point: Point<Pixels>,
+) -> Option<crate::window::HitTest> {
+    let input = &frame.fast_composition_input;
+    if input.order.is_empty() {
+        return None;
+    }
+    let mut result = crate::window::HitTest::default();
+    let mut hover = None;
+    'surfaces: for (surface, native) in input.order.iter().rev() {
+        if let Some(bounds) = native {
+            if bounds.contains(&point) {
+                break;
+            }
+            continue;
+        }
+        let Some(hitboxes) = input.hitboxes.get(surface) else {
+            continue;
+        };
+        for hitbox in hitboxes.iter().rev() {
+            if hitbox.bounds.contains(&point) {
+                result.ids.push(hitbox.id);
+                if hover.is_none() && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll {
+                    hover = Some(result.ids.len());
+                }
+                if hitbox.behavior == HitboxBehavior::BlockMouse {
+                    break 'surfaces;
+                }
+            }
+        }
+    }
+    result.hover_hitbox_count = hover.unwrap_or(result.ids.len());
+    Some(result)
 }
 
 impl SurfaceStarts {
     pub(crate) fn clear(&mut self) {
-        self.scene.clear();
-        self.overlay_hitbox_start = None;
+        self.0.clear();
     }
 
     fn current(&self) -> Option<CompositionSurfaceId> {
-        self.scene.last().map(|(surface, _)| *surface)
+        self.0.last().map(|(surface, _)| *surface)
     }
 
     fn switch_to(&mut self, surface: CompositionSurfaceId, scene_len: usize) {
         if self.current() == Some(surface) {
             return;
         }
-        self.scene.push((surface, scene_len));
-    }
-
-    fn begin_overlay_hitboxes(&mut self, start: usize) {
-        self.overlay_hitbox_start = Some(start);
-    }
-
-    fn overlay_items<'a, T>(&self, items: &'a [T]) -> &'a [T] {
-        let start = self
-            .overlay_hitbox_start
-            .unwrap_or(items.len())
-            .min(items.len());
-        &items[start..]
+        self.0.push((surface, scene_len));
     }
 }
 
@@ -577,7 +738,15 @@ pub(crate) struct WindowCompositionState {
     /// What the window is prepainting, while it prepaints a frame.
     prepainting: Rc<Cell<Option<Host>>>,
     enabled: bool,
+    input_order: Vec<CompositionSurfaceId>,
+    visible: FxHashMap<CompositionSurfaceId, Rc<Cell<bool>>>,
+    input_handlers: FxHashMap<CompositionSurfaceId, Rc<RefCell<NativeInputHandler>>>,
+    pointer_capture: Option<CompositionSurfaceId>,
+    pressed_buttons: Vec<MouseButton>,
+    hovered_native: Option<CompositionSurfaceId>,
 }
+
+type NativeInputHandler = Box<dyn FnMut(&PlatformInput) -> DispatchEventResult>;
 
 /// The [`Window`] field holding its composition.
 pub(crate) struct WindowCompositionHandle(Rc<RefCell<WindowCompositionState>>);
@@ -599,6 +768,12 @@ impl Default for WindowCompositionHandle {
             geometry_dirty: Rc::new(Cell::new(false)),
             prepainting: Rc::new(Cell::new(None)),
             enabled: false,
+            input_order: Vec::new(),
+            visible: FxHashMap::default(),
+            input_handlers: FxHashMap::default(),
+            pointer_capture: None,
+            pressed_buttons: Vec::new(),
+            hovered_native: None,
         })))
     }
 }
@@ -609,6 +784,8 @@ struct ManagedPlatformSurface {
     platform_surface: Rc<dyn PlatformSurfaceAttachment>,
     bounds: Cell<Bounds<DevicePixels>>,
     geometry_dirty: Rc<Cell<bool>>,
+    visible: Rc<Cell<bool>>,
+    input_forwarding: Cell<bool>,
     prepainting: Rc<Cell<Option<Host>>>,
     /// The surface its host was last prepainted on.
     host: Cell<Host>,
@@ -625,6 +802,8 @@ impl ManagedPlatformSurface {
             bounds: Cell::new(platform_surface.bounds()),
             platform_surface,
             geometry_dirty: state.geometry_dirty.clone(),
+            visible: Rc::new(Cell::new(true)),
+            input_forwarding: Cell::new(false),
             prepainting: state.prepainting.clone(),
             host: Cell::new(Host::Base),
             restack: Cell::new(false),
@@ -670,7 +849,17 @@ impl PlatformSurfaceAttachment for ManagedPlatformSurface {
     }
 
     fn set_visible(&self, visible: bool) -> Result<()> {
-        self.platform_surface.set_visible(visible)
+        if self.visible.get() == visible {
+            return Ok(());
+        }
+        self.platform_surface.set_visible(visible)?;
+        self.visible.set(visible);
+        self.geometry_dirty.set(true);
+        Ok(())
+    }
+
+    fn input_forwarding(&self) -> bool {
+        self.input_forwarding.get() && self.visible.get()
     }
 
     fn platform_handle(&self) -> Result<Box<dyn Any>> {
@@ -709,6 +898,42 @@ pub struct WindowComposition<'a> {
 }
 
 impl WindowComposition<'_> {
+    /// Registers a cooperating windowless producer's mouse/wheel consumer.
+    /// Capture runs first; coordinates are in window-content logical pixels.
+    /// OS-managed child views need no handler and keep their platform input path.
+    pub fn on_input(
+        &self,
+        surface: CompositionSurfaceId,
+        handler: impl FnMut(&PlatformInput) -> DispatchEventResult + 'static,
+    ) -> Result<()> {
+        let previous = {
+            let mut state = self.state.borrow_mut();
+            anyhow::ensure!(
+                state.platform_surfaces.contains_key(&surface),
+                "input consumer requires a native surface"
+            );
+            state.platform_surfaces[&surface].input_forwarding.set(true);
+            state
+                .input_handlers
+                .insert(surface, Rc::new(RefCell::new(Box::new(handler))))
+        };
+        if let Err(error) = self.synchronize_platform_order() {
+            let mut state = self.state.borrow_mut();
+            state.platform_surfaces[&surface]
+                .input_forwarding
+                .set(previous.is_some());
+            if let Some(previous) = previous {
+                state.input_handlers.insert(surface, previous);
+            } else {
+                state.input_handlers.remove(&surface);
+            }
+            drop(state);
+            self.synchronize_platform_order().log_err();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Returns the GPUI surface initially rendered below native content.
     pub fn base_surface(&self) -> CompositionSurfaceId {
         self.state.borrow().base_surface
@@ -806,6 +1031,10 @@ impl WindowComposition<'_> {
         }
         let previous_tree = state.tree.clone();
         let platform_surface = state.platform_surfaces.get(&surface).cloned();
+        let was_visible = state
+            .visible
+            .get(&surface)
+            .is_none_or(|visible| visible.get());
         if let Some(platform_surface) = &platform_surface {
             platform_surface.set_visible(false)?;
         }
@@ -816,12 +1045,22 @@ impl WindowComposition<'_> {
             let mut state = self.state.borrow_mut();
             state.tree = previous_tree;
             if let Some(platform_surface) = platform_surface {
-                platform_surface.set_visible(true).log_err();
+                platform_surface.set_visible(was_visible).log_err();
                 state.platform_surfaces.insert(surface, platform_surface);
             }
             drop(state);
             self.synchronize_platform_order().log_err();
             return Err(error);
+        }
+        let mut state = self.state.borrow_mut();
+        state.visible.remove(&surface);
+        state.input_handlers.remove(&surface);
+        if state.pointer_capture == Some(surface) {
+            state.pointer_capture = None;
+            state.pressed_buttons.clear();
+        }
+        if state.hovered_native == Some(surface) {
+            state.hovered_native = None;
         }
         Ok(())
     }
@@ -866,16 +1105,19 @@ impl WindowComposition<'_> {
             platform_surface,
             &self.state.borrow(),
         ));
+        let visible = platform_surface.visible.clone();
         let mut state = self.state.borrow_mut();
         let id = state.tree.insert(kind, None)?;
         let overlay_surface = state.overlay_surface;
         state.tree.place_below(id, overlay_surface)?;
         state.platform_surfaces.insert(id, platform_surface.clone());
+        state.visible.insert(id, visible);
         drop(state);
         if let Err(error) = self.synchronize_platform_order() {
             platform_surface.set_visible(false).log_err();
             let mut state = self.state.borrow_mut();
             state.platform_surfaces.remove(&id);
+            state.visible.remove(&id);
             state.tree.remove(id)?;
             drop(state);
             self.synchronize_platform_order().log_err();
@@ -933,6 +1175,8 @@ impl WindowComposition<'_> {
         }
         self.platform_window.set_composition_order(&surfaces)?;
         state.geometry_dirty.set(false);
+        drop(state);
+        self.state.borrow_mut().input_order = surfaces.iter().map(|surface| surface.id).collect();
         Ok(())
     }
 }
@@ -963,8 +1207,9 @@ impl Window {
         Ok(composition)
     }
 
-    /// Paints a scope of scene operations onto a GPUI surface in this window's
-    /// composition tree, then restores the previous surface.
+    /// Prepaints or paints an element scope on a GPUI composition surface,
+    /// then restores the previous surface. Wrap both phases when selecting a
+    /// surface explicitly so its input regions follow its painted content.
     ///
     /// Inside a scroll layer, whose content is composited from tiles, the
     /// scope paints where the layer does.
@@ -973,13 +1218,23 @@ impl Window {
         surface: CompositionSurfaceId,
         paint: impl FnOnce(&mut Self) -> R,
     ) -> Result<R> {
-        self.invalidator.debug_assert_paint();
+        self.invalidator.debug_assert_paint_or_prepaint();
         anyhow::ensure!(
             self.fast_composition.0.borrow().tree.kind(surface)? == CompositionSurfaceKind::Gpui,
             "paint operations can only target GPUI composition surfaces"
         );
         if self.fast_layers.painting.is_some() {
             return Ok(paint(self));
+        }
+        if self.invalidator.inner.borrow().draw_phase == crate::window::DrawPhase::Prepaint {
+            let previous = self
+                .next_frame
+                .fast_composition_input
+                .scope
+                .replace(surface);
+            let result = paint(self);
+            self.next_frame.fast_composition_input.scope = previous;
+            return Ok(result);
         }
         let previous_surface = self
             .next_frame
@@ -1004,20 +1259,13 @@ fn switch_surface(window: &mut Window, surface: CompositionSurfaceId) {
 /// Stacks what the root view positions, as it prepaints, below the overlay
 /// surface.
 pub(crate) fn begin_base_prepaint(window: &mut Window) {
-    let state = window.fast_composition.0.borrow();
-    state.prepainting.set(Some(Host::Base));
+    begin_input(window, false);
 }
 
 /// Stacks what deferred and window-level draws position, as they prepaint,
 /// above the overlay surface.
 pub(crate) fn begin_overlay_prepaint(window: &mut Window) {
-    let hitbox_start = window.next_frame.hitboxes.len();
-    window
-        .next_frame
-        .fast_composition_starts
-        .begin_overlay_hitboxes(hitbox_start);
-    let state = window.fast_composition.0.borrow();
-    state.prepainting.set(Some(Host::Overlay));
+    begin_input(window, true);
 }
 
 /// Paints what follows, the root view, onto the base surface.
@@ -1057,7 +1305,7 @@ pub(crate) fn begin_overlay(window: &mut Window) {
 /// leaves painting on the surface it was on before.
 pub(crate) fn reuse_starts(window: &mut Window, range: &Range<PaintIndex>) {
     let scenes = range.start.scene_index..range.end.scene_index;
-    let starts = &window.rendered_frame.fast_composition_starts.scene;
+    let starts = &window.rendered_frame.fast_composition_starts.0;
     let first = starts.partition_point(|(_, start)| *start < scenes.start);
     let last = starts.partition_point(|(_, start)| *start < scenes.end);
     if first == last {
@@ -1068,7 +1316,7 @@ pub(crate) fn reuse_starts(window: &mut Window, range: &Range<PaintIndex>) {
     };
     let offset = window.next_frame.scene.len();
     for index in first..last {
-        let (reused, start) = window.rendered_frame.fast_composition_starts.scene[index];
+        let (reused, start) = window.rendered_frame.fast_composition_starts.0[index];
         window
             .next_frame
             .fast_composition_starts
@@ -1081,12 +1329,10 @@ pub(crate) fn reuse_starts(window: &mut Window, range: &Range<PaintIndex>) {
         .switch_to(surface, end);
 }
 
-/// Presents the frame last drawn: on its one surface, or split along the
-/// composition tree once the window composes.
-pub(crate) fn present(window: &mut Window) {
+// Host changes must reach input ownership before the frame's hit test.
+fn synchronize_geometry(window: &mut Window) {
     let state = window.fast_composition.0.clone();
     if !state.borrow().enabled {
-        window.platform_window.draw(&window.rendered_frame.scene);
         return;
     }
     if state.borrow().geometry_dirty.get() {
@@ -1095,17 +1341,28 @@ pub(crate) fn present(window: &mut Window) {
         }
         let composition = WindowComposition {
             platform_window: window.platform_window.as_ref(),
-            state: state.clone(),
+            state,
         };
         if let Err(error) = composition.synchronize_platform_order() {
             log::error!("updating window composition geometry: {error:#}");
         }
     }
+}
+
+/// Presents the frame last drawn: on its one surface, or split along the
+/// composition tree once the window composes.
+pub(crate) fn present(window: &mut Window) {
+    let state = window.fast_composition.0.clone();
+    if !state.borrow().enabled {
+        window.platform_window.draw(&window.rendered_frame.scene);
+        return;
+    }
+    synchronize_geometry(window);
     let state = state.borrow();
     let scene = &window.rendered_frame.scene;
     let layers = composed_scene_layers(
         &state.tree,
-        &window.rendered_frame.fast_composition_starts.scene,
+        &window.rendered_frame.fast_composition_starts.0,
         scene.len(),
     )
     .unwrap_or_else(|error| {
@@ -1116,173 +1373,255 @@ pub(crate) fn present(window: &mut Window) {
         }]
     });
     drop(state);
-    #[cfg(target_os = "macos")]
-    {
-        let input_region = overlay_input_region(
-            window
-                .rendered_frame
-                .fast_composition_starts
-                .overlay_items(&window.rendered_frame.hitboxes),
-        );
-        window.platform_window.set_input_region(Some(&input_region));
-    }
-    window
-        .platform_window
-        .draw_composed(ComposedScene::new(scene, layers));
+    window.platform_window.draw_composed(ComposedScene::new(
+        scene,
+        layers,
+        &window.rendered_frame.fast_composition_input,
+    ));
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn overlay_input_region(hitboxes: &[Hitbox]) -> Vec<Bounds<Pixels>> {
-    hitboxes
-        .iter()
-        .filter_map(|hitbox| clipped_input_bounds(hitbox.bounds, hitbox.content_mask.bounds))
-        .collect()
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn clipped_input_bounds(
-    bounds: Bounds<Pixels>,
-    content_mask: Bounds<Pixels>,
+/// Visibility and ancestor clips come from the existing managed surface tree.
+fn input_bounds(
+    state: &WindowCompositionState,
+    surface: CompositionSurfaceId,
+    mut bounds: Bounds<Pixels>,
+    scale: f32,
 ) -> Option<Bounds<Pixels>> {
-    let bounds = bounds.intersect(&content_mask);
-    (bounds.size.width > px(0.) && bounds.size.height > px(0.)).then_some(bounds)
+    let mut current = Some(surface);
+    while let Some(id) = current {
+        state.tree.kind(id).ok()?;
+        if state.visible.get(&id).is_some_and(|visible| !visible.get()) {
+            return None;
+        }
+        if let Some(native) = state.platform_surfaces.get(&id) {
+            bounds = bounds.intersect(&native.bounds().to_pixels(scale));
+        }
+        current = state.tree.parent(id).ok()?;
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+fn visible_surface(state: &WindowCompositionState, surface: CompositionSurfaceId) -> bool {
+    let mut current = Some(surface);
+    while let Some(id) = current {
+        if state.tree.kind(id).is_err() || state.visible.get(&id).is_some_and(|v| !v.get()) {
+            return false;
+        }
+        current = state.tree.parent(id).ok().flatten();
+    }
+    true
+}
+
+fn native_target(window: &Window, scroll: bool) -> Option<CompositionSurfaceId> {
+    let state = window.fast_composition.0.borrow();
+    if !state.enabled || state.platform_surfaces.is_empty() {
+        return None;
+    }
+    if !scroll {
+        if let Some(captured) = state
+            .pointer_capture
+            .filter(|id| visible_surface(&state, *id))
+        {
+            return Some(captured);
+        }
+    }
+    let point = window.mouse_position;
+    for surface in state.input_order.iter().rev().copied() {
+        if !visible_surface(&state, surface) {
+            continue;
+        }
+        if let Some(native) = state.platform_surfaces.get(&surface) {
+            if input_bounds(
+                &state,
+                surface,
+                native.bounds().to_pixels(window.scale_factor()),
+                window.scale_factor(),
+            )
+            .is_some_and(|bounds| bounds.contains(&point))
+            {
+                return Some(surface);
+            }
+        } else if let Some(regions) = window
+            .rendered_frame
+            .fast_composition_input
+            .hitboxes
+            .get(&surface)
+        {
+            if regions.iter().rev().any(|hitbox| {
+                hitbox.bounds.contains(&point)
+                    && (!scroll || hitbox.behavior == HitboxBehavior::BlockMouse)
+            }) {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// OS-directed native events still run GPUI capture, but cannot activate
+/// unrelated GPUI widgets underneath the native view.
+fn native_mouse(window: &Window, event: &dyn Any) -> bool {
+    if window.captured_hitbox.is_some() {
+        let state = window.fast_composition.0.borrow();
+        return state
+            .pointer_capture
+            .is_some_and(|id| visible_surface(&state, id));
+    }
+    if event
+        .downcast_ref::<MouseMoveEvent>()
+        .is_some_and(|event| event.pressed_button.is_some())
+        && window.fast_composition.0.borrow().pointer_capture.is_none()
+    {
+        return false;
+    }
+    native_target(window, false).is_some()
+}
+
+pub(crate) fn bubble_mouse(window: &Window, event: &dyn Any, cx: &crate::App) -> bool {
+    cx.propagate_event && (cx.has_active_drag() || !native_mouse(window, event))
+}
+
+pub(crate) fn event_target(window: &Window, event: &PlatformInput) -> Option<CompositionSurfaceId> {
+    if !matches!(
+        event,
+        PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_)
+            | PlatformInput::MouseMove(_)
+            | PlatformInput::ScrollWheel(_)
+    ) {
+        return None;
+    }
+    let scroll = matches!(event, PlatformInput::ScrollWheel(_));
+    if !scroll {
+        let state = window.fast_composition.0.borrow();
+        if let Some(captured) = state.pointer_capture {
+            return visible_surface(&state, captured).then_some(captured);
+        }
+    }
+    if window.captured_hitbox.is_some() || matches!(event, PlatformInput::MouseUp(_)) {
+        return None;
+    }
+    if matches!(
+        event,
+        PlatformInput::MouseMove(MouseMoveEvent {
+            pressed_button: Some(_),
+            ..
+        })
+    ) && window.fast_composition.0.borrow().pointer_capture.is_none()
+    {
+        return None;
+    }
+    native_target(window, scroll)
+}
+
+/// Called after the existing dispatcher; windowless producers get one delivery,
+/// while OS-managed views continue through the platform's original event path.
+pub(crate) fn dispatch_native(
+    window: &mut Window,
+    event: &PlatformInput,
+    target: Option<CompositionSurfaceId>,
+    propagate: &mut bool,
+) {
+    let pointer = matches!(
+        event,
+        PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_)
+            | PlatformInput::MouseMove(_)
+            | PlatformInput::MouseExited(_)
+            | PlatformInput::ScrollWheel(_)
+    );
+    if !pointer || !window.fast_composition.0.borrow().enabled {
+        return;
+    }
+    let target = target.filter(|id| visible_surface(&window.fast_composition.0.borrow(), *id));
+    let (handler, leave) = {
+        let mut state = window.fast_composition.0.borrow_mut();
+        let leave = if matches!(
+            event,
+            PlatformInput::MouseMove(_) | PlatformInput::MouseExited(_)
+        ) {
+            let current = if matches!(event, PlatformInput::MouseExited(_)) {
+                None
+            } else {
+                target
+            };
+            let previous = std::mem::replace(&mut state.hovered_native, current);
+            previous
+                .filter(|old| Some(*old) != current)
+                .and_then(|id| state.input_handlers.get(&id).cloned())
+        } else {
+            None
+        };
+        if *propagate && !window.default_prevented {
+            if let PlatformInput::MouseDown(down) = event {
+                if let Some(id) = target {
+                    state.pointer_capture = Some(id);
+                    if !state.pressed_buttons.contains(&down.button) {
+                        state.pressed_buttons.push(down.button);
+                    }
+                }
+            }
+        }
+        let owned_release = matches!(event, PlatformInput::MouseUp(_))
+            && target.is_some()
+            && state.pointer_capture == target;
+        let handler = if (*propagate && !window.default_prevented) || owned_release {
+            target.and_then(|id| state.input_handlers.get(&id).cloned())
+        } else {
+            None
+        };
+        if let PlatformInput::MouseUp(up) = event {
+            // A single press ends even if platform normalization changed its button
+            // (AppKit ctrl-click with Control released before mouse-up).
+            if state.pressed_buttons.len() == 1 {
+                state.pressed_buttons.clear();
+            } else {
+                state.pressed_buttons.retain(|button| *button != up.button);
+            }
+            if state.pressed_buttons.is_empty() {
+                state.pointer_capture = None;
+            }
+        }
+        (handler, leave)
+    };
+    if let Some(leave) = leave {
+        let (position, pressed_button, modifiers) = match event {
+            PlatformInput::MouseMove(event) => {
+                (event.position, event.pressed_button, event.modifiers)
+            }
+            PlatformInput::MouseExited(event) => {
+                (event.position, event.pressed_button, event.modifiers)
+            }
+            _ => unreachable!(),
+        };
+        leave.borrow_mut()(&PlatformInput::MouseExited(MouseExitEvent {
+            position,
+            pressed_button,
+            modifiers,
+        }));
+    }
+    if let Some(handler) = handler {
+        let result = handler.borrow_mut()(event);
+        *propagate &= result.propagate;
+        window.default_prevented |= result.default_prevented;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         CompositionSurfaceId, CompositionSurfaceKind, CompositionTree, Host,
-        ManagedPlatformSurface, PlatformSurfaceAttachment, SurfaceStarts, clipped_input_bounds,
-        composed_scene_layers, restack_native_surfaces,
+        ManagedPlatformSurface, PlatformSurfaceAttachment, composed_scene_layers,
+        restack_native_surfaces,
     };
     use crate::{
-        AppContext as _, Bounds, ContentMask, Context, DevicePixels, Entity,
-        InteractiveElement as _, IntoElement, ParentElement as _, Point, Quad, Render,
-        ScaledPixels, Scene, Size, StyleRefinement, Styled as _, TestAppContext, Window, canvas,
-        deferred, div, fill, px, scene::PaintOperation, size,
+        AppContext as _, Bounds, ContentMask, Context, DevicePixels, Entity, IntoElement,
+        ParentElement as _, Point, Quad, Render, ScaledPixels, Scene, Size, StyleRefinement,
+        Styled as _, TestAppContext, Window, canvas, deferred, div, fill, px,
+        scene::PaintOperation, size,
     };
     use anyhow::Result;
     use std::{any::Any, cell::Cell, rc::Rc};
-
-    #[test]
-    fn input_regions_start_at_overlay_boundary() {
-        let mut starts = SurfaceStarts::default();
-        let hitboxes = [1, 2, 3];
-
-        assert!(starts.overlay_items(&hitboxes).is_empty());
-        starts.begin_overlay_hitboxes(1);
-        assert_eq!(starts.overlay_items(&hitboxes), [2, 3]);
-        starts.clear();
-        assert!(starts.overlay_items(&hitboxes).is_empty());
-    }
-
-    #[test]
-    fn input_regions_clip_to_content_mask() {
-        let bounds = Bounds::new(Point::new(px(10.), px(20.)), size(px(40.), px(50.)));
-        let mask = Bounds::new(Point::new(px(30.), px(0.)), size(px(50.), px(50.)));
-
-        assert_eq!(
-            clipped_input_bounds(bounds, mask),
-            Some(Bounds::new(
-                Point::new(px(30.), px(20.)),
-                size(px(20.), px(30.))
-            ))
-        );
-        assert_eq!(
-            clipped_input_bounds(
-                bounds,
-                Bounds::new(Point::new(px(100.), px(100.)), size(px(10.), px(10.)))
-            ),
-            None
-        );
-    }
-
-    fn current_overlay_input_region(window: &Window) -> Vec<Bounds<crate::Pixels>> {
-        let frame = &window.rendered_frame;
-        super::overlay_input_region(frame.fast_composition_starts.overlay_items(&frame.hitboxes))
-    }
-
-    struct DecorativeOverlay;
-
-    impl Render for DecorativeOverlay {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size(px(100.))
-                .child(deferred(div().size(px(40.)).border_1()))
-        }
-    }
-
-    #[crate::test]
-    fn decorative_overlay_has_no_input_region(cx: &mut TestAppContext) {
-        let window = cx.add_window(|_, _| DecorativeOverlay);
-
-        let input_region = cx
-            .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                current_overlay_input_region(window)
-            })
-            .unwrap();
-
-        assert!(input_region.is_empty());
-    }
-
-    struct OverlayControl {
-        builds: Rc<Cell<usize>>,
-    }
-
-    impl Render for OverlayControl {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            self.builds.set(self.builds.get() + 1);
-            div()
-                .size(px(100.))
-                .child(deferred(div().size(px(40.)).occlude()))
-        }
-    }
-
-    struct OverlayControlPanel {
-        control: Entity<OverlayControl>,
-    }
-
-    impl Render for OverlayControlPanel {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size(px(200.)).child(
-                self.control
-                    .clone()
-                    .cached(StyleRefinement::default().w(px(100.)).h(px(100.))),
-            )
-        }
-    }
-
-    #[crate::test]
-    fn retained_overlay_keeps_input_region(cx: &mut TestAppContext) {
-        let builds = Rc::new(Cell::new(0));
-        let window = cx.add_window({
-            let builds = builds.clone();
-            move |_, cx| OverlayControlPanel {
-                control: cx.new(|_| OverlayControl { builds }),
-            }
-        });
-        let draw = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                current_overlay_input_region(window)
-            })
-            .unwrap()
-        };
-
-        let first = draw(cx);
-        assert_eq!(builds.get(), 1);
-        assert_eq!(first.len(), 1);
-
-        window.update(cx, |_, _, cx| cx.notify()).unwrap();
-        let second = draw(cx);
-        assert_eq!(
-            builds.get(),
-            1,
-            "the control is drawn again from last frame"
-        );
-        assert_eq!(second, first);
-    }
 
     #[test]
     fn composition_surfaces_have_stable_identity_and_explicit_order() -> Result<()> {
@@ -1420,6 +1759,8 @@ mod tests {
             platform_surface: platform_surface.clone(),
             bounds: Cell::new(Bounds::default()),
             geometry_dirty: geometry_dirty.clone(),
+            visible: Rc::new(Cell::new(true)),
+            input_forwarding: Cell::new(false),
             prepainting: Rc::new(Cell::new(None)),
             host: Cell::new(Host::Base),
             restack: Cell::new(false),
@@ -1459,6 +1800,8 @@ mod tests {
             platform_surface: platform.clone(),
             bounds: Cell::new(Bounds::default()),
             geometry_dirty: dirty.clone(),
+            visible: Rc::new(Cell::new(true)),
+            input_forwarding: Cell::new(false),
             prepainting: Rc::new(Cell::new(None)),
             host: Cell::new(Host::Base),
             restack: Cell::new(false),
@@ -1501,6 +1844,8 @@ mod tests {
             platform_surface: platform.clone(),
             bounds: Cell::new(Bounds::default()),
             geometry_dirty: dirty.clone(),
+            visible: Rc::new(Cell::new(true)),
+            input_forwarding: Cell::new(false),
             prepainting: Rc::new(Cell::new(None)),
             host: Cell::new(Host::Base),
             restack: Cell::new(false),
@@ -1659,7 +2004,7 @@ mod tests {
         let frame = &window.rendered_frame;
         let layers = composed_scene_layers(
             &state.tree,
-            &frame.fast_composition_starts.scene,
+            &frame.fast_composition_starts.0,
             frame.scene.len(),
         )
         .unwrap();
