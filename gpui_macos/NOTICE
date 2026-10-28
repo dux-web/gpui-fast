@@ -1,20 +1,20 @@
 GPUI Fast compatibility distribution
 
-Derived from Longbridge GPUI Fast v0.1.10 at
-b836dd970b26830f2124b7cf91b0e19018fd12da:
+Derived from the immutable crates.io GPUI Fast 0.1.12 family, as pinned by
+GPUI Kit 0.8.1 at 18be16887bc2cb462f7b0a33c18bf6183344e7de:
+https://github.com/longbridge/gpui-kit
 https://github.com/longbridge/gpui-fast
 
-Generated with the upstream release exporter from source commit
-8e068a13c198048159553fac2797f60b7647bc10:
-https://github.com/dux-web/gpui-fast
+The release archives were verified against the registry checksums recorded
+in the upstream Kit lockfile. Their original Cargo.toml.orig manifests are used as Cargo.toml; source
+files and upstream Apache-2.0 licenses are retained. Package-local release
+lockfiles are omitted because the consumer workspace owns resolution.
 
-Upstream PR #67 replaces the earlier overlay input-region patch; upstream
-PR #68 replaces the earlier retained-child reparenting patch. Neither old
-patch is replayed in this distribution.
+Sailry contributors preserve the reviewed AppKit descendant hit-test change
+from aa12fda8c18c5b8fb1a0b2ff16650cf138908b8b in
+https://github.com/dux-web/gpui-fast. The overlay first delegates visibility,
+clipping and descendant selection to NSView, then filters only the overlay
+itself through its GPUI input regions. No other production source delta is
+applied to the immutable 0.1.12 release archives.
 
-Sailry contributors modified gpui_macos/src/fast/composition.rs to preserve
-AppKit's descendant, visibility and clipping hit tests before filtering the
-GPUI overlay itself, with regressions in fast/composition/tests.rs.
-
-The upstream Apache-2.0 licenses and attribution notices are retained.
-See LICENSE and each package's LICENSE.
+See LICENSE and each package's LICENSE and LICENSE-APACHE.
